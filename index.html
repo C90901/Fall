@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>كاشف السقوط التجريبي | Fall Detector Demo</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;background:#000;color:#fff;font-family:system-ui,sans-serif;text-align:center}
+  h1{font-size:18px;margin:10px}
+  #wrap{position:relative;width:100%;max-width:520px;margin:auto;background:#111}
+  video,canvas{width:100%;display:block}
+  canvas{position:absolute;inset:0}
+  #state{font-size:26px;font-weight:700;margin:10px 0 2px;min-height:36px}
+  #metrics{font:13px monospace;color:#aaa;min-height:18px}
+  #alert{display:none;background:#c00;font-size:22px;font-weight:700;padding:10px;margin:8px}
+  button{font-size:17px;padding:12px 18px;margin:6px;border:0;border-radius:10px;background:#2a7;color:#fff}
+  button.s{background:#555}
+  #msg{font-size:13px;color:#aaa;padding:6px 14px}
+</style>
+</head>
+<body>
+<h1>كاشف السقوط التجريبي · Fall Detector Demo</h1>
+<div id="wrap"><video id="v" playsinline muted></video><canvas id="c"></canvas></div>
+<div id="alert">⚠ سقوط محتمل · POSSIBLE FALL</div>
+<div id="state">—</div>
+<div id="metrics"></div>
+<div>
+  <button id="start">ابدأ · Start</button>
+  <button id="flip" class="s">تبديل الكاميرا · Flip</button>
+  <button id="stop" class="s">إيقاف · Stop</button>
+</div>
+<label><input type="checkbox" id="voice" checked> الصوت · Voice</label>
+<div id="msg">المعالجة تتم داخل جوالك فقط. لا يُحفظ أو يُرسل أي فيديو. عند الإغلاق أو الإيقاف لا يبقى شيء.<br>Processing happens on your phone only. No video is saved or sent.</div>
+
+<script type="module">
+import {PoseLandmarker, FilesetResolver, DrawingUtils}
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---- Tunable thresholds / قيم قابلة للتعديل ----
+const LYING_ANGLE = 60, SITTING_RATIO = 0.5, WALK_SPEED = 0.3;
+const FALL_WINDOW = 1.5, LYING_CONFIRM = 2.0, MIN_VIS = 0.5;
+
+const LABELS = {
+  "STANDING":["واقف","Standing"], "WALKING":["يمشي","Walking"], "SITTING":["جالس","Sitting"],
+  "LYING":["مستلقٍ","Lying / Resting"], "NONE":["لا يوجد شخص","No person visible"],
+  "UNCLEAR":["غير واضح","Unclear"]
+};
+
+const $ = id => document.getElementById(id);
+const video = $("v"), canvas = $("c"), ctx = canvas.getContext("2d");
+let landmarker, stream, raf, facing = "user", running = false, wake;
+let hipHist = [], lastUpright = null, lyingSince = null, sudden = false, alert_ = false;
+let shownState = null, candState = null, candSince = 0, lastAlertSpoken = 0, t0 = 0;
+
+function speak(text){
+  if(!$("voice").checked || !("speechSynthesis" in window)) return;
+  try{
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "ar-SA";
+    speechSynthesis.speak(u);
+  }catch(e){}
+}
+function beep(){
+  try{
+    const a = new (window.AudioContext||window.webkitAudioContext)();
+    const o = a.createOscillator(); o.frequency.value = 880; o.connect(a.destination);
+    o.start(); setTimeout(()=>{o.stop(); a.close();}, 400);
+  }catch(e){}
+}
+
+async function init(){
+  if(landmarker) return;
+  $("state").textContent = "جارٍ التحميل… Loading…";
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await PoseLandmarker.createFromOptions(fileset, {
+    baseOptions:{modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"},
+    runningMode:"VIDEO", numPoses:1
+  });
+}
+
+async function startCamera(){
+  stopCamera();
+  stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:facing, width:640, height:480}, audio:false});
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  try{ wake = await navigator.wakeLock.request("screen"); }catch(e){}
+}
+function stopCamera(){
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
+}
+
+const mid = (a,b)=>[(a.x+b.x)/2,(a.y+b.y)/2];
+
+function classify(lm, now){
+  const ok = [11,12,23,24,25,26].every(i => (lm[i].visibility ?? 1) > MIN_VIS);
+  if(!ok) return {state:"UNCLEAR", angle:0, ratio:0, speed:0};
+  const [sx,sy] = mid(lm[11],lm[12]), [hx,hy] = mid(lm[23],lm[24]), [kx,ky] = mid(lm[25],lm[26]);
+  const dx = hx-sx, dy = hy-sy, torso = Math.hypot(dx,dy) || 1e-6;
+  const angle = Math.atan2(Math.abs(dx), dy) * 180/Math.PI;
+  const ratio = (ky-hy)/torso;
+  hipHist.push([now,hx]);
+  while(hipHist.length && now-hipHist[0][0] > 1) hipHist.shift();
+  let speed = 0;
+  if(hipHist.length > 1){
+    const dt = hipHist[hipHist.length-1][0]-hipHist[0][0];
+    if(dt > 0) speed = Math.abs(hipHist[hipHist.length-1][1]-hipHist[0][1])/torso/dt;
+  }
+  let state;
+  if(angle > LYING_ANGLE) state = "LYING";
+  else if(ratio < SITTING_RATIO) state = "SITTING";
+  else if(speed > WALK_SPEED) state = "WALKING";
+  else state = "STANDING";
+  return {state, angle, ratio, speed};
+}
+
+function loop(){
+  if(!running) return;
+  raf = requestAnimationFrame(loop);
+  if(video.readyState < 2) return;
+  const now = (performance.now()-t0)/1000;
+  const res = landmarker.detectForVideo(video, performance.now());
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  let info = {state:"NONE", angle:0, ratio:0, speed:0};
+  if(res.landmarks && res.landmarks.length){
+    const lm = res.landmarks[0];
+    info = classify(lm, now);
+    const du = new DrawingUtils(ctx);
+    du.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, {color:"#0f0", lineWidth:3});
+    du.drawLandmarks(lm, {color:"#fff", radius:3});
+  }
+
+  // ---- fall logic / منطق السقوط ----
+  const s = info.state;
+  if(["STANDING","WALKING","SITTING"].includes(s)){
+    lastUpright = now; lyingSince = null; sudden = false; alert_ = false;
+  }else if(s === "LYING"){
+    if(lyingSince === null){
+      lyingSince = now;
+      sudden = lastUpright !== null && (now-lastUpright) < FALL_WINDOW;
+    }
+    if(sudden && now-lyingSince >= LYING_CONFIRM) alert_ = true;
+  }
+
+  // ---- announce stable state changes (>=1s) / إعلان تغيّر الحالة ----
+  if(s !== candState){ candState = s; candSince = now; }
+  if(now-candSince >= 1 && s !== shownState){
+    shownState = s;
+    $("state").textContent = LABELS[s][0] + " · " + LABELS[s][1];
+    if(!alert_ && s !== "UNCLEAR") speak(LABELS[s][0]);
+  }
+
+  $("alert").style.display = alert_ ? "block" : "none";
+  if(alert_ && now-lastAlertSpoken > 5){
+    lastAlertSpoken = now; beep(); speak("تنبيه! سقوط محتمل");
+  }
+  $("metrics").textContent =
+    `angle ${info.angle.toFixed(0)}  ratio ${info.ratio.toFixed(2)}  speed ${info.speed.toFixed(2)}`;
+}
+
+$("start").onclick = async () => {
+  try{
+    await init();
+    await startCamera();
+    hipHist = []; lastUpright = lyingSince = null; sudden = alert_ = false; shownState = candState = null;
+    t0 = performance.now(); running = true; loop();
+    speak("بدأ التحليل");
+  }catch(e){
+    $("state").textContent = "تعذر التشغيل · Could not start";
+    $("metrics").textContent = String(e && e.message || e);
+  }
+};
+$("flip").onclick = async () => {
+  facing = facing === "user" ? "environment" : "user";
+  if(running){ try{ await startCamera(); }catch(e){ $("metrics").textContent = String(e); } }
+};
+$("stop").onclick = () => {
+  running = false; cancelAnimationFrame(raf); stopCamera();
+  try{ speechSynthesis.cancel(); }catch(e){}
+  try{ wake && wake.release(); }catch(e){}
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  $("alert").style.display = "none"; $("state").textContent = "تم الإيقاف · Stopped"; $("metrics").textContent = "";
+};
+</script>
+</body>
+</html>
