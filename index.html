@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>كاشف السقوط التجريبي | Fall Detector Demo</title>
+<title>الكاميرا الذكية التجريبية | Smart Camera Demo</title>
 <style>
   :root{color-scheme:dark}
   body{margin:0;background:#000;color:#fff;font-family:system-ui,sans-serif;text-align:center}
@@ -11,16 +11,18 @@
   #wrap{position:relative;width:100%;max-width:520px;margin:auto;background:#111}
   video,canvas{width:100%;display:block}
   canvas{position:absolute;inset:0}
-  #state{font-size:26px;font-weight:700;margin:10px 0 2px;min-height:36px}
-  #metrics{font:13px monospace;color:#aaa;min-height:18px}
+  #state{font-size:24px;font-weight:700;margin:10px 0 2px;min-height:34px}
+  #metrics{font:12px monospace;color:#aaa;min-height:16px}
   #alert{display:none;background:#c00;font-size:22px;font-weight:700;padding:10px;margin:8px}
-  button{font-size:17px;padding:12px 18px;margin:6px;border:0;border-radius:10px;background:#2a7;color:#fff}
+  button{font-size:16px;padding:11px 16px;margin:5px;border:0;border-radius:10px;background:#2a7;color:#fff}
   button.s{background:#555}
-  #msg{font-size:13px;color:#aaa;padding:6px 14px}
+  #log{max-width:520px;margin:8px auto;padding:8px 12px;background:#111;border-radius:10px;
+       text-align:start;font-size:14px;line-height:1.7;max-height:220px;overflow:auto}
+  #msg{font-size:12px;color:#999;padding:6px 14px}
 </style>
 </head>
 <body>
-<h1>كاشف السقوط التجريبي · Fall Detector Demo</h1>
+<h1>الكاميرا الذكية · Smart Camera</h1>
 <div id="wrap"><video id="v" playsinline muted></video><canvas id="c"></canvas></div>
 <div id="alert">⚠ سقوط محتمل · POSSIBLE FALL</div>
 <div id="state">—</div>
@@ -31,36 +33,70 @@
   <button id="stop" class="s">إيقاف · Stop</button>
 </div>
 <label><input type="checkbox" id="voice" checked> الصوت · Voice</label>
-<div id="msg">المعالجة تتم داخل جوالك فقط. لا يُحفظ أو يُرسل أي فيديو. عند الإغلاق أو الإيقاف لا يبقى شيء.<br>Processing happens on your phone only. No video is saved or sent.</div>
+<div id="log">السجل · Log</div>
+<div>
+  <button id="copy" class="s">نسخ السجل · Copy</button>
+  <button id="save" class="s">حفظ السجل · Save</button>
+</div>
+<div id="msg">المعالجة داخل جوالك فقط، ولا يُرسل أي فيديو. السجل يبقى في الصفحة فقط ويختفي عند إغلاقها إلا إذا ضغطت "حفظ".<br>
+Processing is on your phone only; no video is sent. The log lives in the page and disappears on close unless you press Save.</div>
 
 <script type="module">
-import {PoseLandmarker, FilesetResolver, DrawingUtils}
+import {PoseLandmarker, ObjectDetector, FilesetResolver, DrawingUtils}
   from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
-// ---- Tunable thresholds / قيم قابلة للتعديل ----
+// ---- Thresholds / قيم قابلة للتعديل ----
 const LYING_ANGLE = 60, SITTING_RATIO = 0.5, WALK_SPEED = 0.3;
 const FALL_WINDOW = 1.5, LYING_CONFIRM = 2.0, MIN_VIS = 0.5;
+const OBJ_SCORE = 0.4, OBJ_EVERY_MS = 500, APPEAR_SEC = 1, GONE_SEC = 2;
 
-const LABELS = {
-  "STANDING":["واقف","Standing"], "WALKING":["يمشي","Walking"], "SITTING":["جالس","Sitting"],
-  "LYING":["مستلقٍ","Lying / Resting"], "NONE":["لا يوجد شخص","No person visible"],
-  "UNCLEAR":["غير واضح","Unclear"]
+const STATE_AR = {
+  STANDING:["واقف","Standing"], WALKING:["يمشي","Walking"], SITTING:["جالس","Sitting"],
+  LYING:["مستلقٍ","Lying / Resting"], NONE:["لا يوجد شخص","No person visible"],
+  UNCLEAR:["غير واضح","Unclear"]
+};
+
+// Arabic names for the 80 COCO object classes (literal) / أسماء الأشياء بالعربية
+const OBJ_AR = {
+ "person":"شخص","bicycle":"دراجة","car":"سيارة","motorcycle":"دراجة نارية","airplane":"طائرة","bus":"حافلة",
+ "train":"قطار","truck":"شاحنة","boat":"قارب","traffic light":"إشارة مرور","fire hydrant":"صنبور حريق",
+ "stop sign":"علامة قف","parking meter":"عداد مواقف","bench":"مقعد طويل","bird":"طائر","cat":"قطة","dog":"كلب",
+ "horse":"حصان","sheep":"خروف","cow":"بقرة","elephant":"فيل","bear":"دب","zebra":"حمار وحشي","giraffe":"زرافة",
+ "backpack":"حقيبة ظهر","umbrella":"مظلة","handbag":"حقيبة يد","tie":"ربطة عنق","suitcase":"حقيبة سفر",
+ "frisbee":"قرص طائر","skis":"زلاجات","snowboard":"لوح تزلج على الثلج","sports ball":"كرة رياضية","kite":"طائرة ورقية",
+ "baseball bat":"مضرب بيسبول","baseball glove":"قفاز بيسبول","skateboard":"لوح تزلج","surfboard":"لوح تصفح",
+ "tennis racket":"مضرب تنس","bottle":"زجاجة","wine glass":"كأس نبيذ","cup":"كوب","fork":"شوكة","knife":"سكين",
+ "spoon":"ملعقة","bowl":"وعاء","banana":"موزة","apple":"تفاحة","sandwich":"شطيرة","orange":"برتقالة",
+ "broccoli":"بروكلي","carrot":"جزرة","hot dog":"هوت دوغ","pizza":"بيتزا","donut":"دونات","cake":"كعكة",
+ "chair":"كرسي","couch":"أريكة","potted plant":"نبتة في أصيص","bed":"سرير","dining table":"طاولة طعام",
+ "toilet":"مرحاض","tv":"تلفاز","laptop":"لابتوب","mouse":"فأرة","remote":"جهاز تحكم","keyboard":"لوحة مفاتيح",
+ "cell phone":"هاتف جوال","microwave":"ميكروويف","oven":"فرن","toaster":"محمصة","sink":"مغسلة",
+ "refrigerator":"ثلاجة","book":"كتاب","clock":"ساعة","vase":"مزهرية","scissors":"مقص","teddy bear":"دمية دب",
+ "hair drier":"مجفف شعر","toothbrush":"فرشاة أسنان"
 };
 
 const $ = id => document.getElementById(id);
 const video = $("v"), canvas = $("c"), ctx = canvas.getContext("2d");
-let landmarker, stream, raf, facing = "user", running = false, wake;
+let landmarker, detector, stream, raf, facing = "user", running = false, wake;
 let hipHist = [], lastUpright = null, lyingSince = null, sudden = false, alert_ = false;
 let shownState = null, candState = null, candSince = 0, lastAlertSpoken = 0, t0 = 0;
+let lastDet = 0, lastBoxes = [], tracked = new Map(), personCount = 0, personCand = 0, personCandSince = 0;
+const LOG = [];
 
-function speak(text){
-  if(!$("voice").checked || !("speechSynthesis" in window)) return;
-  try{
-    speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = "ar-SA";
-    speechSynthesis.speak(u);
-  }catch(e){}
+// ---------- speech queue / طابور الكلام ----------
+const queue = []; let speaking = false;
+function pump(){
+  if(speaking || !queue.length || !$("voice").checked || !("speechSynthesis" in window)) return;
+  const u = new SpeechSynthesisUtterance(queue.shift());
+  u.lang = "ar-SA";
+  speaking = true;
+  u.onend = u.onerror = () => { speaking = false; pump(); };
+  try{ speechSynthesis.speak(u); }catch(e){ speaking = false; }
+}
+function say(text, urgent){
+  if(urgent){ queue.length = 0; try{ speechSynthesis.cancel(); }catch(e){} speaking = false; }
+  if(queue.length > 4) queue.shift();
+  queue.push(text); pump();
 }
 function beep(){
   try{
@@ -70,15 +106,34 @@ function beep(){
   }catch(e){}
 }
 
+// ---------- events + log / الأحداث والسجل ----------
+function stamp(){
+  const s = Math.max(0, Math.round((performance.now()-t0)/1000));
+  return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");
+}
+function event(ar, en, urgent){
+  const line = `${stamp()}  ${ar} · ${en}`;
+  LOG.push(line);
+  const box = $("log");
+  box.innerHTML = LOG.slice(-30).map(l => `<div>${l}</div>`).join("");
+  box.scrollTop = box.scrollHeight;
+  say(ar, urgent);
+}
+
 async function init(){
-  if(landmarker) return;
-  $("state").textContent = "جارٍ التحميل… Loading…";
+  if(landmarker && detector) return;
+  $("state").textContent = "جارٍ تحميل النماذج… Loading models…";
   const fileset = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
   landmarker = await PoseLandmarker.createFromOptions(fileset, {
     baseOptions:{modelAssetPath:
       "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"},
     runningMode:"VIDEO", numPoses:1
+  });
+  detector = await ObjectDetector.createFromOptions(fileset, {
+    baseOptions:{modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite"},
+    runningMode:"VIDEO", scoreThreshold:OBJ_SCORE, maxResults:12
   });
 }
 
@@ -90,9 +145,7 @@ async function startCamera(){
   canvas.width = video.videoWidth; canvas.height = video.videoHeight;
   try{ wake = await navigator.wakeLock.request("screen"); }catch(e){}
 }
-function stopCamera(){
-  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
-}
+function stopCamera(){ if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; } }
 
 const mid = (a,b)=>[(a.x+b.x)/2,(a.y+b.y)/2];
 
@@ -118,6 +171,59 @@ function classify(lm, now){
   return {state, angle, ratio, speed};
 }
 
+// ---------- objects / الأشياء ----------
+function runObjects(now){
+  const res = detector.detectForVideo(video, performance.now());
+  lastBoxes = [];
+  const counts = new Map();
+  for(const d of res.detections || []){
+    const c = d.categories[0]; if(!c) continue;
+    const name = c.categoryName;
+    lastBoxes.push({name, score:c.score, b:d.boundingBox});
+    counts.set(name, (counts.get(name)||0)+1);
+  }
+  // appear / disappear
+  for(const [name] of counts){
+    let t = tracked.get(name);
+    if(!t){ t = {first:now, last:now, announced:false}; tracked.set(name,t); }
+    t.last = now;
+    if(!t.announced && now-t.first >= APPEAR_SEC){
+      t.announced = true;
+      if(name !== "person") event(`ظهر ${OBJ_AR[name]||name}`, `${name} appeared`);
+    }
+  }
+  for(const [name,t] of [...tracked]){
+    if(counts.has(name)) continue;
+    const gone = now - t.last;
+    if(!t.announced && gone > APPEAR_SEC) tracked.delete(name);
+    else if(t.announced && gone >= GONE_SEC){
+      tracked.delete(name);
+      if(name !== "person") event(`اختفى ${OBJ_AR[name]||name}`, `${name} disappeared`);
+    }
+  }
+  // people count / عدد الأشخاص
+  const n = counts.get("person") || 0;
+  if(n !== personCand){ personCand = n; personCandSince = now; }
+  if(now-personCandSince >= APPEAR_SEC && n !== personCount){
+    personCount = n;
+    if(n === 0) event("لا يوجد أشخاص", "no people");
+    else if(n === 1) event("شخص واحد", "one person");
+    else event(`عدد الأشخاص ${n}`, `${n} people`);
+  }
+}
+
+function drawBoxes(){
+  ctx.lineWidth = 2; ctx.font = "16px sans-serif";
+  for(const o of lastBoxes){
+    if(o.name === "person") continue;
+    const {originX:x, originY:y, width:w, height:h} = o.b;
+    ctx.strokeStyle = "#ff0"; ctx.strokeRect(x,y,w,h);
+    const label = `${OBJ_AR[o.name]||o.name} · ${o.name}`;
+    ctx.fillStyle = "#ff0"; ctx.fillRect(x, Math.max(0,y-20), ctx.measureText(label).width+8, 20);
+    ctx.fillStyle = "#000"; ctx.fillText(label, x+4, Math.max(14,y-5));
+  }
+}
+
 function loop(){
   if(!running) return;
   raf = requestAnimationFrame(loop);
@@ -125,6 +231,9 @@ function loop(){
   const now = (performance.now()-t0)/1000;
   const res = landmarker.detectForVideo(video, performance.now());
   ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if(performance.now()-lastDet > OBJ_EVERY_MS){ lastDet = performance.now(); try{ runObjects(now); }catch(e){} }
+  drawBoxes();
 
   let info = {state:"NONE", angle:0, ratio:0, speed:0};
   if(res.landmarks && res.landmarks.length){
@@ -135,7 +244,7 @@ function loop(){
     du.drawLandmarks(lm, {color:"#fff", radius:3});
   }
 
-  // ---- fall logic / منطق السقوط ----
+  // ---- fall logic ----
   const s = info.state;
   if(["STANDING","WALKING","SITTING"].includes(s)){
     lastUpright = now; lyingSince = null; sudden = false; alert_ = false;
@@ -144,23 +253,23 @@ function loop(){
       lyingSince = now;
       sudden = lastUpright !== null && (now-lastUpright) < FALL_WINDOW;
     }
-    if(sudden && now-lyingSince >= LYING_CONFIRM) alert_ = true;
+    if(sudden && now-lyingSince >= LYING_CONFIRM && !alert_){
+      alert_ = true; lastAlertSpoken = now; beep();
+      event("تنبيه! سقوط محتمل", "ALERT! possible fall", true);
+    }
   }
 
-  // ---- announce stable state changes (>=1s) / إعلان تغيّر الحالة ----
+  // ---- stable state change ----
   if(s !== candState){ candState = s; candSince = now; }
   if(now-candSince >= 1 && s !== shownState){
     shownState = s;
-    $("state").textContent = LABELS[s][0] + " · " + LABELS[s][1];
-    if(!alert_ && s !== "UNCLEAR") speak(LABELS[s][0]);
+    $("state").textContent = STATE_AR[s][0] + " · " + STATE_AR[s][1];
+    if(!alert_ && s !== "UNCLEAR" && s !== "NONE") event(`الشخص ${STATE_AR[s][0]}`, `person ${STATE_AR[s][1].toLowerCase()}`);
   }
 
   $("alert").style.display = alert_ ? "block" : "none";
-  if(alert_ && now-lastAlertSpoken > 5){
-    lastAlertSpoken = now; beep(); speak("تنبيه! سقوط محتمل");
-  }
-  $("metrics").textContent =
-    `angle ${info.angle.toFixed(0)}  ratio ${info.ratio.toFixed(2)}  speed ${info.speed.toFixed(2)}`;
+  if(alert_ && now-lastAlertSpoken > 5){ lastAlertSpoken = now; beep(); say("تنبيه! سقوط محتمل", true); }
+  $("metrics").textContent = `angle ${info.angle.toFixed(0)}  ratio ${info.ratio.toFixed(2)}  speed ${info.speed.toFixed(2)}`;
 }
 
 $("start").onclick = async () => {
@@ -168,8 +277,10 @@ $("start").onclick = async () => {
     await init();
     await startCamera();
     hipHist = []; lastUpright = lyingSince = null; sudden = alert_ = false; shownState = candState = null;
-    t0 = performance.now(); running = true; loop();
-    speak("بدأ التحليل");
+    tracked.clear(); lastBoxes = []; personCount = personCand = 0;
+    t0 = performance.now(); running = true;
+    event("بدأ التحليل", "analysis started");
+    loop();
   }catch(e){
     $("state").textContent = "تعذر التشغيل · Could not start";
     $("metrics").textContent = String(e && e.message || e);
@@ -182,9 +293,21 @@ $("flip").onclick = async () => {
 $("stop").onclick = () => {
   running = false; cancelAnimationFrame(raf); stopCamera();
   try{ speechSynthesis.cancel(); }catch(e){}
+  queue.length = 0; speaking = false;
   try{ wake && wake.release(); }catch(e){}
   ctx.clearRect(0,0,canvas.width,canvas.height);
   $("alert").style.display = "none"; $("state").textContent = "تم الإيقاف · Stopped"; $("metrics").textContent = "";
+};
+$("copy").onclick = async () => {
+  try{ await navigator.clipboard.writeText(LOG.join("\n")); $("copy").textContent = "تم النسخ ✓"; }
+  catch(e){ $("copy").textContent = "تعذر النسخ"; }
+  setTimeout(()=>$("copy").textContent = "نسخ السجل · Copy", 1500);
+};
+$("save").onclick = () => {
+  const blob = new Blob([LOG.join("\n")], {type:"text/plain;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "camera-log.txt"; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
 };
 </script>
 </body>
