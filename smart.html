@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>الكاميرا الذكية المحلية | Local Smart Camera</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;background:#000;color:#fff;font-family:system-ui,sans-serif;text-align:center}
+  h1{font-size:17px;margin:8px}
+  #wrap{width:100%;max-width:640px;margin:auto;background:#111}
+  video{width:100%;display:block}
+  #now{font-size:21px;font-weight:700;margin:12px 10px 2px;min-height:30px;line-height:1.5}
+  #sub{font-size:14px;color:#bbb;margin:0 10px 6px;min-height:20px}
+  #alert{display:none;background:#c00;font-size:20px;font-weight:700;padding:10px;margin:8px}
+  #status{font:12px monospace;color:#8a8;min-height:16px;margin:2px 10px;white-space:pre-wrap}
+  button{font-size:16px;padding:11px 16px;margin:5px;border:0;border-radius:10px;background:#2a7;color:#fff}
+  button.s{background:#555}
+  select,input[type=file]{font-size:14px;padding:8px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;max-width:92%}
+  #model-box{max-width:640px;margin:8px auto;padding:8px 10px;background:#111;border-radius:10px;font-size:13px}
+  #log{max-width:640px;margin:8px auto;padding:8px 12px;background:#111;border-radius:10px;
+       text-align:start;font-size:14px;line-height:1.7;max-height:240px;overflow:auto}
+  #msg{font-size:12px;color:#999;padding:6px 14px}
+</style>
+</head>
+<body>
+<h1>الكاميرا الذكية المحلية · Local Smart Camera</h1>
+
+<div id="wrap"><video id="v" playsinline muted></video></div>
+<div id="alert">⚠ سقوط محتمل · POSSIBLE FALL</div>
+<div id="now">—</div>
+<div id="sub"></div>
+<div id="status"></div>
+
+<div>
+  <button id="start">ابدأ · Start</button>
+  <button id="flip" class="s">تبديل الكاميرا · Flip</button>
+  <button id="stop" class="s">إيقاف · Stop</button>
+</div>
+<label><input type="checkbox" id="voice" checked> الصوت · Voice</label>
+
+<div id="model-box">
+  <div><b>وصف المشهد بنموذج محلي (اختياري) · Local scene description (optional)</b></div>
+  <div style="margin:6px 0">اختر ملف نموذج Gemma-3n من جوالك · Pick a Gemma-3n model file from your phone</div>
+  <input type="file" id="modelFile">
+  <div style="margin-top:6px">
+    <button id="loadModel" class="s">تحميل النموذج · Load model</button>
+  </div>
+  <div style="margin-top:6px">
+    لغة الوصف · Language
+    <select id="lang"><option value="en">English</option><option value="ar">العربية</option></select>
+    كل · Every
+    <select id="every">
+      <option value="0">أسرع ما يمكن · ASAP</option>
+      <option value="5000">5 s</option>
+      <option value="10000" selected>10 s</option>
+      <option value="20000">20 s</option>
+    </select>
+  </div>
+</div>
+
+<div id="log">السجل · Log</div>
+<div>
+  <button id="copy" class="s">نسخ السجل · Copy</button>
+  <button id="save" class="s">حفظ السجل · Save</button>
+</div>
+
+<div id="msg">
+  لا تُرسَل صور ولا فيديو لأي جهة. التحليل كله داخل جوالك. تُحمَّل مكتبات التحليل والنماذج الصغيرة من الإنترنت في أول فتح فقط ثم تُحفَظ ليعمل بعدها بدون إنترنت.<br>
+  No images or video are sent anywhere. All analysis runs on your phone. Analysis libraries and small models are downloaded on first open only, then cached for offline use.
+</div>
+
+<script type="module">
+// ---------------- libraries (vision) ----------------
+let PoseLandmarker, ObjectDetector, FilesetResolver;
+try{
+  ({PoseLandmarker, ObjectDetector, FilesetResolver} =
+    await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"));
+  document.getElementById("now").textContent = "جاهز · Ready";
+}catch(e){
+  document.getElementById("now").textContent = "فشل تحميل المكتبة · Library failed";
+  document.getElementById("status").textContent = String(e && e.message || e);
+}
+try{ if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js"); }catch(e){}
+
+// ---------------- config ----------------
+const LYING_ANGLE = 60, SITTING_RATIO = 0.5, WALK_SPEED = 0.3;
+const FALL_WINDOW = 1.5, LYING_CONFIRM = 2.0, MIN_VIS = 0.5;
+const OBJ_SCORE = 0.3, OBJ_EVERY_MS = 600, POSE_EVERY_MS = 150, APPEAR_SEC = 1, GONE_SEC = 2;
+const STATE_AR = {
+  STANDING:["واقف","standing"], WALKING:["يمشي","walking"], SITTING:["جالس","sitting"],
+  LYING:["مستلقٍ","lying"], NONE:["لا يوجد شخص","no person"], UNCLEAR:["غير واضح","unclear"]
+};
+const OBJ_AR = {
+ "person":"شخص","bicycle":"دراجة","car":"سيارة","motorcycle":"دراجة نارية","airplane":"طائرة","bus":"حافلة",
+ "train":"قطار","truck":"شاحنة","boat":"قارب","traffic light":"إشارة مرور","fire hydrant":"صنبور حريق",
+ "stop sign":"علامة قف","parking meter":"عداد مواقف","bench":"مقعد طويل","bird":"طائر","cat":"قطة","dog":"كلب",
+ "horse":"حصان","sheep":"خروف","cow":"بقرة","elephant":"فيل","bear":"دب","zebra":"حمار وحشي","giraffe":"زرافة",
+ "backpack":"حقيبة ظهر","umbrella":"مظلة","handbag":"حقيبة يد","tie":"ربطة عنق","suitcase":"حقيبة سفر",
+ "frisbee":"قرص طائر","skis":"زلاجات","snowboard":"لوح تزلج على الثلج","sports ball":"كرة رياضية","kite":"طائرة ورقية",
+ "baseball bat":"مضرب بيسبول","baseball glove":"قفاز بيسبول","skateboard":"لوح تزلج","surfboard":"لوح تصفح",
+ "tennis racket":"مضرب تنس","bottle":"زجاجة","wine glass":"كأس نبيذ","cup":"كوب","fork":"شوكة","knife":"سكين",
+ "spoon":"ملعقة","bowl":"وعاء","banana":"موزة","apple":"تفاحة","sandwich":"شطيرة","orange":"برتقالة",
+ "broccoli":"بروكلي","carrot":"جزرة","hot dog":"هوت دوغ","pizza":"بيتزا","donut":"دونات","cake":"كعكة",
+ "chair":"كرسي","couch":"أريكة","potted plant":"نبتة في أصيص","bed":"سرير","dining table":"طاولة طعام",
+ "toilet":"مرحاض","tv":"تلفاز","laptop":"لابتوب","mouse":"فأرة","remote":"جهاز تحكم","keyboard":"لوحة مفاتيح",
+ "cell phone":"هاتف جوال","microwave":"ميكروويف","oven":"فرن","toaster":"محمصة","sink":"مغسلة",
+ "refrigerator":"ثلاجة","book":"كتاب","clock":"ساعة","vase":"مزهرية","scissors":"مقص","teddy bear":"دمية دب",
+ "hair drier":"مجفف شعر","toothbrush":"فرشاة أسنان"
+};
+
+const $ = id => document.getElementById(id);
+const video = $("v");
+let landmarker, detector, stream, raf, facing = "environment", running = false, wake, t0 = 0;
+let hipHist = [], lastUpright = null, lyingSince = null, sudden = false, alertOn = false;
+let shownState = null, candState = null, candSince = 0;
+let lastPose = 0, lastDet = 0, tracked = new Map(), personCount = 0, personCand = 0, personCandSince = 0;
+let llm = null, describing = false, prevDesc = "", descTimer = null;
+const LOG = [];
+
+// ---------------- speech ----------------
+const queue = []; let speaking = false;
+function pump(){
+  if(speaking || !queue.length || !$("voice").checked || !("speechSynthesis" in window)) return;
+  const item = queue.shift();
+  const u = new SpeechSynthesisUtterance(item.text);
+  u.lang = item.lang; speaking = true;
+  u.onend = u.onerror = () => { speaking = false; pump(); };
+  try{ speechSynthesis.speak(u); }catch(e){ speaking = false; }
+}
+function say(text, urgent, lang){
+  if(urgent){ queue.length = 0; try{ speechSynthesis.cancel(); }catch(e){} speaking = false; }
+  if(queue.length > 3) queue.shift();
+  queue.push({text, lang: lang || "ar-SA"}); pump();
+}
+function beep(){
+  try{
+    const a = new (window.AudioContext||window.webkitAudioContext)();
+    const o = a.createOscillator(); o.frequency.value = 880; o.connect(a.destination);
+    o.start(); setTimeout(()=>{o.stop(); a.close();}, 400);
+  }catch(e){}
+}
+
+// ---------------- log ----------------
+function stamp(){
+  const s = Math.max(0, Math.round((performance.now()-t0)/1000));
+  return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");
+}
+function event(ar, en, urgent){
+  LOG.push(`${stamp()}  ${ar} · ${en}`);
+  const box = $("log");
+  box.innerHTML = LOG.slice(-40).map(l => `<div>${l}</div>`).join("");
+  box.scrollTop = box.scrollHeight;
+  say(ar, urgent);
+}
+
+// ---------------- init local vision models ----------------
+async function initVision(){
+  if(landmarker) return;
+  $("now").textContent = "جارٍ تحميل النماذج… Loading models…";
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await PoseLandmarker.createFromOptions(fileset, {
+    baseOptions:{modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"},
+    runningMode:"VIDEO", numPoses:1
+  });
+  try{
+    detector = await ObjectDetector.createFromOptions(fileset, {
+      baseOptions:{modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite"},
+      runningMode:"VIDEO", scoreThreshold:OBJ_SCORE, maxResults:12
+    });
+  }catch(e){ detector = null; $("status").textContent = "object detector: " + (e && e.message || e); }
+}
+
+// ---------------- camera ----------------
+async function startCamera(){
+  stopCamera();
+  stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:facing, width:{ideal:1280}, height:{ideal:720}}, audio:false});
+  video.srcObject = stream; await video.play();
+  try{ wake = await navigator.wakeLock.request("screen"); }catch(e){}
+}
+function stopCamera(){ if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; } }
+
+// ---------------- posture ----------------
+const mid = (a,b)=>[(a.x+b.x)/2,(a.y+b.y)/2];
+function classify(lm, now){
+  const ok = [11,12,23,24,25,26].every(i => (lm[i].visibility ?? 1) > MIN_VIS);
+  if(!ok) return "UNCLEAR";
+  const [sx,sy] = mid(lm[11],lm[12]), [hx,hy] = mid(lm[23],lm[24]), [kx,ky] = mid(lm[25],lm[26]);
+  const dx = hx-sx, dy = hy-sy, torso = Math.hypot(dx,dy) || 1e-6;
+  const angle = Math.atan2(Math.abs(dx), dy) * 180/Math.PI;
+  const ratio = (ky-hy)/torso;
+  hipHist.push([now,hx]);
+  while(hipHist.length && now-hipHist[0][0] > 1) hipHist.shift();
+  let speed = 0;
+  if(hipHist.length > 1){
+    const dt = hipHist[hipHist.length-1][0]-hipHist[0][0];
+    if(dt > 0) speed = Math.abs(hipHist[hipHist.length-1][1]-hipHist[0][1])/torso/dt;
+  }
+  if(angle > LYING_ANGLE) return "LYING";
+  if(ratio < SITTING_RATIO) return "SITTING";
+  if(speed > WALK_SPEED) return "WALKING";
+  return "STANDING";
+}
+
+function updatePose(now){
+  const res = landmarker.detectForVideo(video, performance.now());
+  const s = (res.landmarks && res.landmarks.length) ? classify(res.landmarks[0], now) : "NONE";
+
+  if(["STANDING","WALKING","SITTING"].includes(s)){
+    lastUpright = now; lyingSince = null; sudden = false;
+    if(alertOn){ alertOn = false; $("alert").style.display = "none"; }
+  }else if(s === "LYING"){
+    if(lyingSince === null){
+      lyingSince = now;
+      sudden = lastUpright !== null && (now-lastUpright) < FALL_WINDOW;
+    }
+    if(sudden && now-lyingSince >= LYING_CONFIRM && !alertOn){
+      alertOn = true; $("alert").style.display = "block"; beep();
+      event("تنبيه! سقوط محتمل", "ALERT! possible fall", true);
+    }
+  }
+  if(s !== candState){ candState = s; candSince = now; }
+  if(now-candSince >= 1 && s !== shownState){
+    shownState = s;
+    if(!alertOn && s !== "UNCLEAR" && s !== "NONE") event(`الشخص ${STATE_AR[s][0]}`, `person ${STATE_AR[s][1]}`);
+  }
+}
+
+// ---------------- objects ----------------
+function updateObjects(now){
+  const res = detector.detectForVideo(video, performance.now());
+  const counts = new Map();
+  for(const d of res.detections || []){
+    const c = d.categories[0]; if(!c) continue;
+    counts.set(c.categoryName, (counts.get(c.categoryName)||0)+1);
+  }
+  for(const [name] of counts){
+    let t = tracked.get(name);
+    if(!t){ t = {first:now, last:now, announced:false}; tracked.set(name,t); }
+    t.last = now;
+    if(!t.announced && now-t.first >= APPEAR_SEC){
+      t.announced = true;
+      if(name !== "person") event(`ظهر ${OBJ_AR[name]||name}`, `${name} appeared`);
+    }
+  }
+  for(const [name,t] of [...tracked]){
+    if(counts.has(name)) continue;
+    const gone = now - t.last;
+    if(!t.announced && gone > APPEAR_SEC) tracked.delete(name);
+    else if(t.announced && gone >= GONE_SEC){
+      tracked.delete(name);
+      if(name !== "person") event(`اختفى ${OBJ_AR[name]||name}`, `${name} disappeared`);
+    }
+  }
+  const n = counts.get("person") || 0;
+  if(n !== personCand){ personCand = n; personCandSince = now; }
+  if(now-personCandSince >= APPEAR_SEC && n !== personCount){
+    personCount = n;
+    if(n === 0) event("لا يوجد أشخاص", "no people");
+    else if(n === 1) event("شخص واحد", "one person");
+    else event(`عدد الأشخاص ${n}`, `${n} people`);
+  }
+}
+
+function loop(){
+  if(!running) return;
+  raf = requestAnimationFrame(loop);
+  if(video.readyState < 2) return;
+  const nowMs = performance.now(), now = (nowMs-t0)/1000;
+  try{
+    if(nowMs-lastPose > POSE_EVERY_MS){ lastPose = nowMs; updatePose(now); }
+    if(detector && nowMs-lastDet > OBJ_EVERY_MS){ lastDet = nowMs; updateObjects(now); }
+  }catch(e){ $("status").textContent = "error: " + (e && e.message || e); }
+}
+
+// ---------------- local scene description (optional, Gemma-3n via MediaPipe GenAI) ----------------
+function loadScript(src){
+  return new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = src; s.crossOrigin = "anonymous"; s.onload = res; s.onerror = () => rej(new Error("script load failed: " + src));
+    document.head.appendChild(s);
+  });
+}
+$("loadModel").onclick = async () => {
+  const f = $("modelFile").files[0];
+  if(!f){ $("status").textContent = "اختر ملف النموذج أولًا · Pick the model file first"; return; }
+  if(!navigator.gpu){ $("status").textContent = "WebGPU غير متاح في هذا المتصفح · WebGPU not available in this browser"; return; }
+  try{
+    $("status").textContent = "جارٍ تحميل النموذج (قد يستغرق دقائق)… Loading model (may take minutes)…";
+    if(!window.LlmInference) await loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-genai@latest/genai_bundle.cjs");
+    const genai = await window.FilesetResolver.forGenAiTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-genai@latest/wasm");
+    llm = await window.LlmInference.createFromOptions(genai, {
+      baseOptions:{ modelAssetPath: URL.createObjectURL(f) },
+      maxTokens: 1000, topK: 40, temperature: 0.3, randomSeed: 1, maxNumImages: 1
+    });
+    $("status").textContent = "النموذج جاهز · Model ready";
+    if(running) scheduleDescribe(0);
+  }catch(e){
+    llm = null;
+    $("status").textContent = "تعذر تحميل النموذج · Model failed: " + (e && e.message || e);
+  }
+};
+
+function frameCanvas(){
+  const w = 448, h = Math.round(448 * video.videoHeight / video.videoWidth) || 336;
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  c.getContext("2d").drawImage(video, 0, 0, w, h);
+  return c;
+}
+function similarity(a, b){
+  const A = new Set(a.toLowerCase().split(/\s+/)), B = new Set(b.toLowerCase().split(/\s+/));
+  let inter = 0; for(const x of A) if(B.has(x)) inter++;
+  return inter / Math.max(1, A.size + B.size - inter);
+}
+async function describeOnce(){
+  if(!llm || !running || describing) return;
+  describing = true;
+  try{
+    const lang = $("lang").value;
+    const instr = lang === "ar"
+      ? "صف بجملة قصيرة واحدة بالعربية ما يفعله الشخص وأهم الأشياء الظاهرة. إذا لم يوجد شخص فاذكر ما تراه فقط."
+      : "In one short sentence, say what the person is doing and the main visible objects. If no person is visible, just say what you see.";
+    const t = performance.now();
+    const out = (await llm.generateResponse([
+      "<start_of_turn>user\n", {imageSource: frameCanvas()}, "\n" + instr + "<end_of_turn>\n<start_of_turn>model\n"
+    ])).trim().slice(0, 220);
+    const secs = ((performance.now()-t)/1000).toFixed(1);
+    $("now").textContent = out;
+    $("sub").textContent = `${secs} s`;
+    if(out && (!prevDesc || similarity(out, prevDesc) < 0.6)){
+      LOG.push(`${stamp()}  ${out}`);
+      $("log").innerHTML = LOG.slice(-40).map(l => `<div>${l}</div>`).join("");
+      $("log").scrollTop = $("log").scrollHeight;
+      say(out, false, lang === "ar" ? "ar-SA" : "en-US");
+    }
+    prevDesc = out || prevDesc;
+  }catch(e){
+    $("status").textContent = "description error: " + (e && e.message || e);
+  }finally{
+    describing = false;
+    scheduleDescribe(Number($("every").value));
+  }
+}
+function scheduleDescribe(ms){
+  clearTimeout(descTimer);
+  if(running && llm) descTimer = setTimeout(describeOnce, ms);
+}
+
+// ---------------- controls ----------------
+$("start").onclick = async () => {
+  try{
+    await initVision();
+    await startCamera();
+    hipHist = []; lastUpright = lyingSince = null; sudden = alertOn = false; shownState = candState = null;
+    tracked.clear(); personCount = personCand = 0; prevDesc = "";
+    t0 = performance.now(); running = true;
+    $("now").textContent = "—";
+    event("بدأ التحليل", "analysis started");
+    loop(); scheduleDescribe(500);
+  }catch(e){
+    $("now").textContent = "تعذر التشغيل · Could not start";
+    $("status").textContent = String(e && e.message || e);
+  }
+};
+$("flip").onclick = async () => {
+  facing = facing === "user" ? "environment" : "user";
+  if(running){ try{ await startCamera(); }catch(e){ $("status").textContent = String(e); } }
+};
+$("stop").onclick = () => {
+  running = false; cancelAnimationFrame(raf); clearTimeout(descTimer); stopCamera();
+  try{ speechSynthesis.cancel(); }catch(e){}
+  queue.length = 0; speaking = false;
+  try{ wake && wake.release(); }catch(e){}
+  $("alert").style.display = "none"; $("now").textContent = "تم الإيقاف · Stopped"; $("sub").textContent = "";
+};
+$("copy").onclick = async () => {
+  try{ await navigator.clipboard.writeText(LOG.join("\n")); $("copy").textContent = "تم النسخ ✓"; }
+  catch(e){ $("copy").textContent = "تعذر النسخ"; }
+  setTimeout(()=>$("copy").textContent = "نسخ السجل · Copy", 1500);
+};
+$("save").onclick = () => {
+  const blob = new Blob([LOG.join("\n")], {type:"text/plain;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "camera-log.txt"; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+};
+</script>
+</body>
+</html>
