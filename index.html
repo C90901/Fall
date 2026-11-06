@@ -42,8 +42,15 @@
 Processing is on your phone only; no video is sent. The log lives in the page and disappears on close unless you press Save.</div>
 
 <script type="module">
-import {PoseLandmarker, ObjectDetector, FilesetResolver, DrawingUtils}
-  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+let PoseLandmarker, ObjectDetector, FilesetResolver, DrawingUtils;
+try{
+  ({PoseLandmarker, ObjectDetector, FilesetResolver, DrawingUtils} =
+    await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"));
+  document.getElementById("state").textContent = "جاهز · Ready";
+}catch(e){
+  document.getElementById("state").textContent = "فشل تحميل المكتبة · Library failed";
+  document.getElementById("metrics").textContent = String(e && e.message || e);
+}
 
 // ---- Thresholds / قيم قابلة للتعديل ----
 const LYING_ANGLE = 60, SITTING_RATIO = 0.5, WALK_SPEED = 0.3;
@@ -122,7 +129,7 @@ function event(ar, en, urgent){
 }
 
 async function init(){
-  if(landmarker && detector) return;
+  if(landmarker) return;
   $("state").textContent = "جارٍ تحميل النماذج… Loading models…";
   const fileset = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
@@ -131,11 +138,16 @@ async function init(){
       "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"},
     runningMode:"VIDEO", numPoses:1
   });
-  detector = await ObjectDetector.createFromOptions(fileset, {
-    baseOptions:{modelAssetPath:
-      "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite"},
-    runningMode:"VIDEO", scoreThreshold:OBJ_SCORE, maxResults:12
-  });
+  try{
+    detector = await ObjectDetector.createFromOptions(fileset, {
+      baseOptions:{modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite"},
+      runningMode:"VIDEO", scoreThreshold:OBJ_SCORE, maxResults:12
+    });
+  }catch(e){
+    detector = null;
+    objErr = "detector load failed: " + String(e && e.message || e);
+  }
 }
 
 async function startCamera(){
@@ -233,7 +245,7 @@ function loop(){
   const res = landmarker.detectForVideo(video, performance.now());
   ctx.clearRect(0,0,canvas.width,canvas.height);
 
-  if(performance.now()-lastDet > OBJ_EVERY_MS){
+  if(detector && performance.now()-lastDet > OBJ_EVERY_MS){
     lastDet = performance.now();
     try{ runObjects(now); objCount = lastBoxes.length; }
     catch(e){ objErr = String(e && e.message || e); if(!objErrShown){ objErrShown = true; event("خطأ في التعرف على الأشياء", "object detection error: " + objErr); } }
