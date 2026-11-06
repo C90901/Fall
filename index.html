@@ -48,7 +48,7 @@ import {PoseLandmarker, ObjectDetector, FilesetResolver, DrawingUtils}
 // ---- Thresholds / قيم قابلة للتعديل ----
 const LYING_ANGLE = 60, SITTING_RATIO = 0.5, WALK_SPEED = 0.3;
 const FALL_WINDOW = 1.5, LYING_CONFIRM = 2.0, MIN_VIS = 0.5;
-const OBJ_SCORE = 0.4, OBJ_EVERY_MS = 500, APPEAR_SEC = 1, GONE_SEC = 2;
+const OBJ_SCORE = 0.3, OBJ_EVERY_MS = 500, APPEAR_SEC = 1, GONE_SEC = 2;
 
 const STATE_AR = {
   STANDING:["واقف","Standing"], WALKING:["يمشي","Walking"], SITTING:["جالس","Sitting"],
@@ -80,6 +80,7 @@ const video = $("v"), canvas = $("c"), ctx = canvas.getContext("2d");
 let landmarker, detector, stream, raf, facing = "user", running = false, wake;
 let hipHist = [], lastUpright = null, lyingSince = null, sudden = false, alert_ = false;
 let shownState = null, candState = null, candSince = 0, lastAlertSpoken = 0, t0 = 0;
+let objCount = 0, objErr = "", objErrShown = false;
 let lastDet = 0, lastBoxes = [], tracked = new Map(), personCount = 0, personCand = 0, personCandSince = 0;
 const LOG = [];
 
@@ -232,7 +233,11 @@ function loop(){
   const res = landmarker.detectForVideo(video, performance.now());
   ctx.clearRect(0,0,canvas.width,canvas.height);
 
-  if(performance.now()-lastDet > OBJ_EVERY_MS){ lastDet = performance.now(); try{ runObjects(now); }catch(e){} }
+  if(performance.now()-lastDet > OBJ_EVERY_MS){
+    lastDet = performance.now();
+    try{ runObjects(now); objCount = lastBoxes.length; }
+    catch(e){ objErr = String(e && e.message || e); if(!objErrShown){ objErrShown = true; event("خطأ في التعرف على الأشياء", "object detection error: " + objErr); } }
+  }
   drawBoxes();
 
   let info = {state:"NONE", angle:0, ratio:0, speed:0};
@@ -269,7 +274,7 @@ function loop(){
 
   $("alert").style.display = alert_ ? "block" : "none";
   if(alert_ && now-lastAlertSpoken > 5){ lastAlertSpoken = now; beep(); say("تنبيه! سقوط محتمل", true); }
-  $("metrics").textContent = `angle ${info.angle.toFixed(0)}  ratio ${info.ratio.toFixed(2)}  speed ${info.speed.toFixed(2)}`;
+  $("metrics").textContent = `angle ${info.angle.toFixed(0)}  ratio ${info.ratio.toFixed(2)}  speed ${info.speed.toFixed(2)} | objects ${objCount} ${objErr}`;
 }
 
 $("start").onclick = async () => {
